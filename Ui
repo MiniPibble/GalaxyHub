@@ -1,0 +1,970 @@
+--[[
+    GalaxyHub  |  UI Template (no functions attached)
+    Window size: 280 x 360
+
+    Everything in the UI works (tabs, toggles, stepper, themes, slider, log, codes list,
+    toasts, drag, minimize, RightShift, unload) but the toggles do nothing by themselves.
+    Put your own code inside the three empty hooks in the "FUNCTIONS" section:
+        Functions.onToggle(key, value)
+        Functions.onRedeem(code)
+        Functions.onUnload()
+]]
+
+---------------------------------------------------------------------
+-- CLEAN UP OLD INSTANCE ---------------------------------------------
+---------------------------------------------------------------------
+if getgenv and getgenv().GalaxyHubUnload then
+    pcall(getgenv().GalaxyHubUnload)
+end
+
+---------------------------------------------------------------------
+-- SERVICES ----------------------------------------------------------
+---------------------------------------------------------------------
+local cloneref = cloneref or function(x) return x end
+local function service(name) return cloneref(game:GetService(name)) end
+
+local Players = service("Players")
+local TweenService = service("TweenService")
+local RunService = service("RunService")
+local UIS = service("UserInputService")
+local HttpService = service("HttpService")
+local ReplicatedStorage = service("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local wait, delay = task.wait, task.delay
+
+local getconns = getconnections or (debug and debug.getconnections)
+local getups = (debug and debug.getupvalues) or getupvalues
+local setup = (debug and debug.setupvalue) or setupvalue
+local setclip = setclipboard or toclipboard
+
+---------------------------------------------------------------------
+-- CONFIG ------------------------------------------------------------
+---------------------------------------------------------------------
+local CONFIG_FILE = "galaxyhub_config.json"
+local cfg = {
+    autoCode = true,
+    autoSubmit = true,
+    retype = false,
+    riddle = false,
+    submitAfter = 3,
+    skipDupes = true,
+    autoCopy = false,
+    toasts = true,
+    antiAfk = false,
+    autoSave = true,
+    theme = 1,
+    opacity = 0,
+}
+
+pcall(function()
+    if type(isfile) == "function" and type(readfile) == "function" and isfile(CONFIG_FILE) then
+        local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
+        if type(data) == "table" then
+            for k, default in pairs(cfg) do
+                if type(data[k]) == type(default) then cfg[k] = data[k] end
+            end
+        end
+    end
+end)
+cfg.submitAfter = math.max(1, math.floor(cfg.submitAfter))
+cfg.theme = math.clamp(math.floor(cfg.theme), 1, 5)
+cfg.opacity = math.clamp(cfg.opacity, 0, 0.6)
+
+local function saveConfig()
+    if not cfg.autoSave or type(writefile) ~= "function" then return end
+    pcall(function() writefile(CONFIG_FILE, HttpService:JSONEncode(cfg)) end)
+end
+
+---------------------------------------------------------------------
+-- STATE -------------------------------------------------------------
+---------------------------------------------------------------------
+local S = {
+    seen = {},          -- every code handled this session
+    dedupe = {},        -- short-lived notification dedupe
+    buffer = {},        -- code parts waiting for "submit after"
+    focusedBox = nil,
+    lastBox = nil,
+    watchedBox = nil,
+    textConn = nil,
+    ancConn = nil,
+    lastText = "",
+    pendingText = nil,
+    pendingBox = nil,
+    pendingUntil = 0,
+    pendingToken = 0,
+    lastLog = nil,
+    hooked = false,
+}
+local Stats = { captured = 0, submitted = 0, invalid = 0 }
+local conns = {}
+local Unloaded = false
+local startTime = os.clock()
+
+local function track(c) conns[#conns + 1] = c return c end
+
+-- UI hooks (filled in once the UI exists)
+local Hooks = {}
+local function log(msg, kind) if Hooks.log then Hooks.log(msg, kind or "info") end end
+local function refresh() if Hooks.refresh then Hooks.refresh() end end
+local function addHistory(code, status) if Hooks.history then Hooks.history(code, status) end end
+local function toast(msg) if Hooks.toast then Hooks.toast(msg) end end
+
+---------------------------------------------------------------------
+-- FUNCTIONS (EMPTY - put your own code here) -------------------------
+---------------------------------------------------------------------
+local Functions = {}
+
+-- Called every time a toggle or the "Submit after" stepper changes.
+-- key   = "autoCode" | "autoSubmit" | "retype" | "riddle" | "submitAfter"
+--         | "skipDupes" | "autoCopy" | "toasts" | "antiAfk" | "autoSave"
+-- value = true/false (toggles) or a number (stepper)
+function Functions.onToggle(key, value)
+    -- your code here
+end
+
+-- Called when Redeem is pressed, Enter is hit in the box, or a code in the Codes tab is clicked.
+function Functions.onRedeem(code)
+    -- your code here
+    -- tip: use Hooks.history(code, "Sent") / Hooks.log("text", "ok") / Stats.submitted = Stats.submitted + 1; Hooks.refresh()
+end
+
+-- Called when the window is unloaded (clean up your own connections here).
+function Functions.onUnload()
+    -- your code here
+end
+
+---------------------------------------------------------------------
+-- THEME -------------------------------------------------------------
+---------------------------------------------------------------------
+local THEMES = {
+    { name = "Nebula",    a = Color3.fromRGB(168, 85, 247),  b = Color3.fromRGB(59, 130, 246) },
+    { name = "Aurora",    a = Color3.fromRGB(16, 230, 170),  b = Color3.fromRGB(59, 130, 246) },
+    { name = "Supernova", a = Color3.fromRGB(255, 90, 140),  b = Color3.fromRGB(255, 170, 60) },
+    { name = "Cosmic",    a = Color3.fromRGB(99, 102, 241),  b = Color3.fromRGB(236, 72, 153) },
+    { name = "Mono",      a = Color3.fromRGB(235, 235, 240), b = Color3.fromRGB(120, 120, 135) },
+}
+local theme = THEMES[cfg.theme]
+local themed, borders, textGrads, refreshers = {}, {}, {}, {}
+
+local WHITE = Color3.new(1, 1, 1)
+local GREEN = Color3.fromRGB(80, 230, 140)
+local RED = Color3.fromRGB(255, 90, 100)
+local AMBER = Color3.fromRGB(255, 200, 90)
+local GRAY = Color3.fromRGB(150, 150, 172)
+local OFF = Color3.fromRGB(38, 38, 52)
+local PANEL = Color3.fromRGB(13, 13, 21)
+local LINE = Color3.fromRGB(34, 34, 52)
+
+local function borderSeq()
+    return ColorSequence.new({
+        ColorSequenceKeypoint.new(0, theme.a),
+        ColorSequenceKeypoint.new(0.35, theme.b),
+        ColorSequenceKeypoint.new(0.7, Color3.fromRGB(12, 12, 22)),
+        ColorSequenceKeypoint.new(1, theme.a),
+    })
+end
+local function textSeq() return ColorSequence.new(theme.a, theme.b) end
+
+local function paint(obj, prop, key)
+    themed[#themed + 1] = { obj, prop, key }
+    obj[prop] = theme[key]
+end
+
+local function setTheme(i)
+    cfg.theme = i
+    theme = THEMES[i]
+    for _, t in ipairs(themed) do pcall(function() t[1][t[2]] = theme[t[3]] end) end
+    for _, g in ipairs(borders) do g.Color = borderSeq() end
+    for _, g in ipairs(textGrads) do g.Color = textSeq() end
+    for _, f in ipairs(refreshers) do pcall(f) end
+    saveConfig()
+end
+
+---------------------------------------------------------------------
+-- UI HELPERS --------------------------------------------------------
+---------------------------------------------------------------------
+local function new(class, props, kids)
+    local o = Instance.new(class)
+    for k, v in pairs(props or {}) do o[k] = v end
+    for _, c in ipairs(kids or {}) do c.Parent = o end
+    return o
+end
+local function corner(r) return new("UICorner", { CornerRadius = UDim.new(0, r) }) end
+local function circle() return new("UICorner", { CornerRadius = UDim.new(1, 0) }) end
+local function stroke(color, th, tr)
+    return new("UIStroke", {
+        Color = color, Thickness = th or 1, Transparency = tr or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    })
+end
+local function tween(o, props, t)
+    if Unloaded then return end
+    TweenService:Create(o, TweenInfo.new(t or 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+local function label(parent, props)
+    props.BackgroundTransparency = 1
+    props.Font = props.Font or Enum.Font.Gotham
+    props.TextSize = props.TextSize or 11
+    props.TextColor3 = props.TextColor3 or Color3.fromRGB(215, 215, 225)
+    props.ZIndex = props.ZIndex or 4
+    props.Parent = parent
+    return new("TextLabel", props)
+end
+local function card(parent, props)
+    props.BackgroundColor3 = props.BackgroundColor3 or PANEL
+    props.BorderSizePixel = 0
+    props.ZIndex = props.ZIndex or 3
+    props.Parent = parent
+    return new("Frame", props, { corner(8), stroke(LINE, 1) })
+end
+local function scroller(parent, props)
+    props.BackgroundColor3 = props.BackgroundColor3 or Color3.fromRGB(8, 8, 14)
+    props.BorderSizePixel = 0
+    props.ScrollBarThickness = 3
+    props.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    props.CanvasSize = UDim2.new()
+    props.ZIndex = 3
+    props.Parent = parent
+    local s = new("ScrollingFrame", props, {
+        corner(8), stroke(LINE, 1),
+        new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }),
+        new("UIPadding", {
+            PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5),
+            PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5),
+        }),
+    })
+    paint(s, "ScrollBarImageColor3", "a")
+    return s
+end
+local function button(parent, text, size, pos, accent)
+    local b = new("TextButton", {
+        Text = text, Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = WHITE,
+        AutoButtonColor = false, BackgroundColor3 = Color3.fromRGB(24, 24, 38),
+        Size = size, Position = pos, BorderSizePixel = 0, ZIndex = 4, Parent = parent,
+    }, { corner(7) })
+    if accent then
+        paint(b, "BackgroundColor3", "a")
+        b.TextColor3 = Color3.fromRGB(10, 10, 16)
+        b.MouseEnter:Connect(function() tween(b, { BackgroundTransparency = 0.2 }) end)
+        b.MouseLeave:Connect(function() tween(b, { BackgroundTransparency = 0 }) end)
+    else
+        b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = Color3.fromRGB(38, 38, 58) }) end)
+        b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = Color3.fromRGB(24, 24, 38) }) end)
+    end
+    return b
+end
+
+---------------------------------------------------------------------
+-- WINDOW (280 x 360) ------------------------------------------------
+---------------------------------------------------------------------
+local FULL = UDim2.fromOffset(280, 360)
+local MINI = UDim2.fromOffset(280, 38)
+
+local gui = new("ScreenGui", {
+    Name = GUI_NAME, ResetOnSpawn = false, IgnoreGuiInset = true,
+    DisplayOrder = 999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+do
+    local ok = pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+    if not ok or not gui.Parent then gui.Parent = PlayerGui end
+    -- remove leftovers from older scripts
+    for _, old in ipairs({ "LevithonCodeRedeemer", "ACECodeSniperUI", "AutoTypeCodesUI" }) do
+        pcall(function()
+            local a = game:GetService("CoreGui"):FindFirstChild(old)
+            if a then a:Destroy() end
+        end)
+        local b = PlayerGui:FindFirstChild(old)
+        if b then b:Destroy() end
+    end
+end
+
+local main = new("Frame", {
+    Name = "Window", Size = UDim2.fromOffset(280, 0),
+    Position = UDim2.new(0.5, -140, 0.5, -180),
+    BackgroundColor3 = Color3.fromRGB(6, 6, 10), BorderSizePixel = 0,
+    Active = true, ClipsDescendants = true, Parent = gui,
+}, { corner(14) })
+main.BackgroundTransparency = cfg.opacity
+
+new("UIGradient", {
+    Color = ColorSequence.new(Color3.fromRGB(16, 10, 32), Color3.fromRGB(4, 4, 8)),
+    Rotation = 65, Parent = main,
+})
+
+local mainStroke = new("UIStroke", {
+    Thickness = 1.6, Color = WHITE, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = main,
+})
+local borderGrad = new("UIGradient", { Parent = mainStroke })
+borders[#borders + 1] = borderGrad
+borderGrad.Color = borderSeq()
+
+-- starfield
+local rng = Random.new()
+local starLayer = new("Frame", {
+    Name = "Stars", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 1, Parent = main,
+})
+local stars = {}
+for i = 1, 24 do
+    local sz = rng:NextInteger(1, 2)
+    stars[i] = new("Frame", {
+        Size = UDim2.fromOffset(sz, sz),
+        Position = UDim2.new(rng:NextNumber(), 0, rng:NextNumber(), 0),
+        BackgroundColor3 = WHITE, BackgroundTransparency = rng:NextNumber(0.4, 0.95),
+        BorderSizePixel = 0, ZIndex = 1, Parent = starLayer,
+    }, { circle() })
+end
+task.spawn(function()
+    while not Unloaded do
+        local s = stars[rng:NextInteger(1, #stars)]
+        tween(s, { BackgroundTransparency = rng:NextNumber(0.2, 0.95) }, rng:NextNumber(0.6, 1.4))
+        wait(0.12)
+    end
+end)
+
+---------------------------------------------------------------------
+-- HEADER ------------------------------------------------------------
+---------------------------------------------------------------------
+local header = new("Frame", {
+    Name = "Header", Size = UDim2.new(1, 0, 0, 38), BackgroundTransparency = 1,
+    Active = true, ZIndex = 3, Parent = main,
+})
+local logo = new("Frame", {
+    Size = UDim2.fromOffset(10, 10), Position = UDim2.fromOffset(15, 14), Rotation = 45,
+    BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 4, Parent = header,
+}, { corner(2) })
+local logoGrad = new("UIGradient", { Rotation = 45, Parent = logo })
+logoGrad.Color = textSeq()
+textGrads[#textGrads + 1] = logoGrad
+
+local title = label(header, {
+    Text = "GalaxyHub", Font = Enum.Font.GothamBold, TextSize = 15, TextColor3 = WHITE,
+    TextXAlignment = Enum.TextXAlignment.Left, Size = UDim2.fromOffset(150, 18), Position = UDim2.fromOffset(34, 3),
+})
+local titleGrad = new("UIGradient", { Parent = title })
+titleGrad.Color = textSeq()
+textGrads[#textGrads + 1] = titleGrad
+
+label(header, {
+    Text = "Auto Code Redeemer", Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = GRAY,
+    TextXAlignment = Enum.TextXAlignment.Left, Size = UDim2.fromOffset(150, 12), Position = UDim2.fromOffset(34, 21),
+})
+
+local function headerButton(text, xFromRight, hover)
+    local b = new("TextButton", {
+        Text = text, Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = WHITE,
+        BackgroundColor3 = Color3.fromRGB(22, 22, 34), AutoButtonColor = false, BorderSizePixel = 0,
+        Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, xFromRight, 0.5, -11),
+        ZIndex = 5, Parent = header,
+    }, { corner(6) })
+    b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = hover }) end)
+    b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = Color3.fromRGB(22, 22, 34) }) end)
+    return b
+end
+local closeBtn = headerButton("X", -30, RED)
+local minBtn = headerButton("-", -56, Color3.fromRGB(50, 50, 72))
+
+new("Frame", {
+    Size = UDim2.new(1, -20, 0, 1), Position = UDim2.new(0, 10, 1, -1),
+    BackgroundColor3 = LINE, BorderSizePixel = 0, ZIndex = 3, Parent = header,
+})
+
+---------------------------------------------------------------------
+-- BODY: STATUS + TABS -----------------------------------------------
+---------------------------------------------------------------------
+local body = new("Frame", {
+    Name = "Body", Size = UDim2.new(1, 0, 1, -38), Position = UDim2.fromOffset(0, 38),
+    BackgroundTransparency = 1, ZIndex = 2, Parent = main,
+})
+
+local dot = new("Frame", {
+    Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(14, 8),
+    BackgroundColor3 = GREEN, BorderSizePixel = 0, ZIndex = 4, Parent = body,
+}, { circle() })
+local statusLabel = label(body, {
+    Text = "Scanning for codes", Font = Enum.Font.GothamMedium, TextSize = 10, TextColor3 = GREEN,
+    TextXAlignment = Enum.TextXAlignment.Left, Size = UDim2.fromOffset(170, 24), Position = UDim2.fromOffset(28, 0),
+})
+local timerLabel = label(body, {
+    Text = "00:00", Font = Enum.Font.Code, TextSize = 10, TextColor3 = GRAY,
+    TextXAlignment = Enum.TextXAlignment.Right, Size = UDim2.fromOffset(60, 24), Position = UDim2.new(1, -72, 0, 0),
+})
+
+local TAB_NAMES = { "Main", "Codes", "Log", "Settings" }
+local tabBar = card(body, {
+    Size = UDim2.fromOffset(264, 26), Position = UDim2.fromOffset(8, 26),
+    BackgroundColor3 = Color3.fromRGB(11, 11, 18),
+})
+local pill = new("Frame", {
+    Size = UDim2.fromOffset(62, 22), Position = UDim2.fromOffset(2, 2),
+    BorderSizePixel = 0, BackgroundTransparency = 0.78, ZIndex = 3, Parent = tabBar,
+}, { corner(6) })
+paint(pill, "BackgroundColor3", "a")
+
+local pageHost = new("Frame", {
+    Size = UDim2.fromOffset(264, 256), Position = UDim2.fromOffset(8, 58),
+    BackgroundTransparency = 1, ZIndex = 2, Parent = body,
+})
+local pages, tabButtons = {}, {}
+for i = 1, #TAB_NAMES do
+    pages[i] = new("Frame", {
+        Name = TAB_NAMES[i], Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        Visible = (i == 1), ZIndex = 2, Parent = pageHost,
+    })
+end
+
+local function switchTab(i)
+    for j, p in ipairs(pages) do p.Visible = (j == i) end
+    for j, b in ipairs(tabButtons) do
+        b.TextColor3 = (j == i) and WHITE or GRAY
+    end
+    tween(pill, { Position = UDim2.fromOffset(2 + (i - 1) * 66, 2) }, 0.2)
+end
+for i, name in ipairs(TAB_NAMES) do
+    local b = new("TextButton", {
+        Text = name, Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = GRAY,
+        BackgroundTransparency = 1, Size = UDim2.fromOffset(66, 26), Position = UDim2.fromOffset((i - 1) * 66, 0),
+        AutoButtonColor = false, ZIndex = 4, Parent = tabBar,
+    })
+    b.MouseButton1Click:Connect(function() switchTab(i) end)
+    tabButtons[i] = b
+end
+
+---------------------------------------------------------------------
+-- TOAST -------------------------------------------------------------
+---------------------------------------------------------------------
+local toastFrame = new("Frame", {
+    Size = UDim2.fromOffset(240, 28), Position = UDim2.new(0.5, -120, 1, 10),
+    BackgroundColor3 = Color3.fromRGB(18, 18, 30), BorderSizePixel = 0, ZIndex = 20, Parent = main,
+}, { corner(8) })
+local toastStroke = stroke(WHITE, 1.2)
+toastStroke.Parent = toastFrame
+paint(toastStroke, "Color", "a")
+local toastLabel = label(toastFrame, {
+    Text = "", Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = WHITE,
+    Size = UDim2.fromScale(1, 1), ZIndex = 21,
+})
+local toastToken = 0
+function Hooks.toast(msg)
+    if not cfg.toasts or Unloaded then return end
+    toastToken = toastToken + 1
+    local t = toastToken
+    toastLabel.Text = msg
+    tween(toastFrame, { Position = UDim2.new(0.5, -120, 1, -38) }, 0.25)
+    delay(2.2, function()
+        if t == toastToken and not Unloaded then
+            tween(toastFrame, { Position = UDim2.new(0.5, -120, 1, 10) }, 0.25)
+        end
+    end)
+end
+
+---------------------------------------------------------------------
+-- ROW COMPONENTS ----------------------------------------------------
+---------------------------------------------------------------------
+local function switchRow(parent, text, key, onChange, order)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
+        LayoutOrder = order or 0, ZIndex = 3, Parent = parent,
+    })
+    label(row, {
+        Text = text, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left,
+        Size = UDim2.new(1, -56, 1, 0), Position = UDim2.fromOffset(10, 0),
+    })
+    local track_ = new("TextButton", {
+        Text = "", AutoButtonColor = false, Size = UDim2.fromOffset(32, 16),
+        Position = UDim2.new(1, -42, 0.5, -8), BackgroundColor3 = OFF, BorderSizePixel = 0,
+        ZIndex = 4, Parent = row,
+    }, { circle() })
+    local pin = new("Frame", {
+        Size = UDim2.fromOffset(12, 12), Position = UDim2.new(0, 2, 0.5, -6),
+        BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 5, Parent = track_,
+    }, { circle() })
+
+    local function render(animate)
+        local on = cfg[key]
+        local goalC = on and theme.a or OFF
+        local goalP = on and UDim2.new(1, -14, 0.5, -6) or UDim2.new(0, 2, 0.5, -6)
+        if animate then
+            tween(track_, { BackgroundColor3 = goalC }, 0.15)
+            tween(pin, { Position = goalP }, 0.15)
+        else
+            track_.BackgroundColor3 = goalC
+            pin.Position = goalP
+        end
+    end
+    render(false)
+    refreshers[#refreshers + 1] = function() render(false) end
+
+    track_.MouseButton1Click:Connect(function()
+        cfg[key] = not cfg[key]
+        render(true)
+        saveConfig()
+        if onChange then onChange(cfg[key]) end
+        Functions.onToggle(key, cfg[key])
+    end)
+    return row
+end
+
+local function stepperRow(parent, text, key, minV, maxV, order)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
+        LayoutOrder = order or 0, ZIndex = 3, Parent = parent,
+    })
+    label(row, {
+        Text = text, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left,
+        Size = UDim2.new(1, -90, 1, 0), Position = UDim2.fromOffset(10, 0),
+    })
+    local holder = new("Frame", {
+        Size = UDim2.fromOffset(72, 20), Position = UDim2.new(1, -82, 0.5, -10),
+        BackgroundColor3 = Color3.fromRGB(20, 20, 32), BorderSizePixel = 0, ZIndex = 4, Parent = row,
+    }, { corner(6), stroke(LINE, 1) })
+    local minus = new("TextButton", {
+        Text = "-", Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = WHITE,
+        BackgroundTransparency = 1, Size = UDim2.fromOffset(20, 20), ZIndex = 5, Parent = holder,
+    })
+    local val = label(holder, {
+        Text = tostring(cfg[key]), Font = Enum.Font.GothamBold, TextSize = 11,
+        Size = UDim2.fromOffset(32, 20), Position = UDim2.fromOffset(20, 0), ZIndex = 5,
+    })
+    paint(val, "TextColor3", "a")
+    local plus = new("TextButton", {
+        Text = "+", Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = WHITE,
+        BackgroundTransparency = 1, Size = UDim2.fromOffset(20, 20), Position = UDim2.fromOffset(52, 0),
+        ZIndex = 5, Parent = holder,
+    })
+    local function set(v)
+        cfg[key] = math.clamp(v, minV, maxV)
+        val.Text = tostring(cfg[key])
+        saveConfig()
+        Functions.onToggle(key, cfg[key])
+    end
+    minus.MouseButton1Click:Connect(function() set(cfg[key] - 1) end)
+    plus.MouseButton1Click:Connect(function() set(cfg[key] + 1) end)
+    return row
+end
+
+local function listCard(parent, rows, order)
+    return card(parent, {
+        Size = UDim2.new(1, 0, 0, rows * 26 + 8), LayoutOrder = order or 0,
+    })
+end
+local function rowLayout(c)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = c })
+    new("UIPadding", { PaddingTop = UDim.new(0, 4), Parent = c })
+end
+
+---------------------------------------------------------------------
+-- PAGE 1: MAIN ------------------------------------------------------
+---------------------------------------------------------------------
+local mainPage = pages[1]
+local statNums = {}
+local function statCard(x, titleText, key)
+    local c = card(mainPage, { Size = UDim2.fromOffset(84, 46), Position = UDim2.fromOffset(x, 0) })
+    local n = label(c, {
+        Text = "0", Font = Enum.Font.GothamBold, TextSize = 17,
+        Size = UDim2.new(1, 0, 0, 22), Position = UDim2.fromOffset(0, 4),
+    })
+    paint(n, "TextColor3", "a")
+    label(c, {
+        Text = titleText, TextSize = 9, TextColor3 = GRAY,
+        Size = UDim2.new(1, 0, 0, 12), Position = UDim2.fromOffset(0, 28),
+    })
+    statNums[key] = n
+end
+statCard(0, "CAPTURED", "captured")
+statCard(90, "SUBMITTED", "submitted")
+statCard(180, "INVALID", "invalid")
+
+local togCard = listCard(mainPage, 5)
+togCard.Position = UDim2.fromOffset(0, 54)
+rowLayout(togCard)
+switchRow(togCard, "Auto Code", "autoCode", function(v)
+    log(v and "Auto Code enabled" or "Auto Code paused", v and "ok" or "warn")
+    toast(v and "Auto Code: ON" or "Auto Code: OFF")
+    refresh()
+end, 1)
+switchRow(togCard, "Auto Submit", "autoSubmit", function(v)
+    log("Auto Submit " .. (v and "on" or "off"), "info")
+end, 2)
+switchRow(togCard, "Retype Invalid", "retype", function(v)
+    log("Retype Invalid " .. (v and "on" or "off"), "info")
+end, 3)
+switchRow(togCard, "Riddle Solver (beta)", "riddle", function(v)
+    log("Riddle Solver " .. (v and "on" or "off"), "info")
+end, 4)
+stepperRow(togCard, "Submit after", "submitAfter", 1, 20, 5)
+
+-- manual entry
+local manual = card(mainPage, { Size = UDim2.fromOffset(264, 32), Position = UDim2.fromOffset(0, 200) })
+local manualBox = new("TextBox", {
+    Text = "", PlaceholderText = "Enter a code manually...", PlaceholderColor3 = Color3.fromRGB(95, 95, 118),
+    ClearTextOnFocus = false, Font = Enum.Font.Code, TextSize = 12, TextColor3 = WHITE,
+    TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+    Size = UDim2.new(1, -100, 1, 0), Position = UDim2.fromOffset(10, 0), ZIndex = 4, Parent = manual,
+})
+local manualBtn = button(manual, "Redeem", UDim2.fromOffset(78, 22), UDim2.new(1, -84, 0.5, -11), true)
+
+label(mainPage, {
+    Text = "RightShift  -  hide / show GalaxyHub", TextSize = 9, TextColor3 = Color3.fromRGB(105, 105, 130),
+    Size = UDim2.fromOffset(264, 14), Position = UDim2.fromOffset(0, 238),
+})
+
+local function redeemManual(code)
+    code = (code or ""):gsub("%s+", "")
+    if code == "" then toast("Type a code first") return end
+    addHistory(code, "Pending")
+    log("Redeem pressed: " .. code, "info")
+    Functions.onRedeem(code)
+end
+manualBtn.MouseButton1Click:Connect(function()
+    local c = manualBox.Text
+    manualBox.Text = ""
+    redeemManual(c)
+end)
+manualBox.FocusLost:Connect(function(enter)
+    if enter then
+        local c = manualBox.Text
+        manualBox.Text = ""
+        redeemManual(c)
+    end
+end)
+
+---------------------------------------------------------------------
+-- PAGE 2: CODES HISTORY ---------------------------------------------
+---------------------------------------------------------------------
+local codesPage = pages[2]
+local copyAllBtn = button(codesPage, "Copy All", UDim2.fromOffset(128, 24), UDim2.fromOffset(0, 0), false)
+local clearCodesBtn = button(codesPage, "Clear", UDim2.fromOffset(128, 24), UDim2.fromOffset(136, 0), false)
+local codeScroll = scroller(codesPage, { Size = UDim2.fromOffset(264, 222), Position = UDim2.fromOffset(0, 30) })
+local emptyLabel = label(codesPage, {
+    Text = "No codes yet.\nClick a code here to resend it.", TextSize = 10, TextColor3 = Color3.fromRGB(105, 105, 130),
+    Size = UDim2.fromOffset(264, 60), Position = UDim2.fromOffset(0, 100), ZIndex = 5,
+})
+
+local BADGE = {
+    Pending = Color3.fromRGB(150, 150, 172),
+    Sent = GREEN, Invalid = AMBER, Failed = RED,
+}
+local entries, entryOrder, entryCounter = {}, {}, 0
+
+local function setBadge(e, status)
+    e.badge.Text = status
+    e.badge.TextColor3 = BADGE[status] or GRAY
+    e.status = status
+end
+
+function Hooks.history(code, status)
+    local e = entries[code]
+    if e then setBadge(e, status) return end
+    entryCounter = entryCounter + 1
+    local row = new("TextButton", {
+        Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 28),
+        BackgroundColor3 = Color3.fromRGB(16, 16, 26), BorderSizePixel = 0,
+        LayoutOrder = -entryCounter, ZIndex = 4, Parent = codeScroll,
+    }, { corner(6) })
+    label(row, {
+        Text = code, Font = Enum.Font.Code, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd, Size = UDim2.new(1, -78, 1, 0), Position = UDim2.fromOffset(8, 0), ZIndex = 5,
+    })
+    local badge = label(row, {
+        Text = "", Font = Enum.Font.GothamBold, TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Right, Size = UDim2.fromOffset(64, 28),
+        Position = UDim2.new(1, -70, 0, 0), ZIndex = 5,
+    })
+    e = { row = row, badge = badge, code = code }
+    entries[code] = e
+    entryOrder[#entryOrder + 1] = code
+    setBadge(e, status)
+    emptyLabel.Visible = false
+
+    row.MouseEnter:Connect(function() tween(row, { BackgroundColor3 = Color3.fromRGB(26, 26, 42) }) end)
+    row.MouseLeave:Connect(function() tween(row, { BackgroundColor3 = Color3.fromRGB(16, 16, 26) }) end)
+    row.MouseButton1Click:Connect(function() redeemManual(code) end)
+end
+
+copyAllBtn.MouseButton1Click:Connect(function()
+    if #entryOrder == 0 then toast("Nothing to copy") return end
+    if setclip then
+        pcall(setclip, table.concat(entryOrder, "\n"))
+        toast("Copied " .. #entryOrder .. " codes")
+    else
+        toast("Clipboard not supported")
+    end
+end)
+clearCodesBtn.MouseButton1Click:Connect(function()
+    for _, e in pairs(entries) do e.row:Destroy() end
+    entries, entryOrder = {}, {}
+    emptyLabel.Visible = true
+    toast("Codes cleared")
+end)
+
+---------------------------------------------------------------------
+-- PAGE 3: LOG -------------------------------------------------------
+---------------------------------------------------------------------
+local logPage = pages[3]
+local copyLogBtn = button(logPage, "Copy Log", UDim2.fromOffset(128, 24), UDim2.fromOffset(0, 0), false)
+local clearLogBtn = button(logPage, "Clear", UDim2.fromOffset(128, 24), UDim2.fromOffset(136, 0), false)
+local logScroll = scroller(logPage, { Size = UDim2.fromOffset(264, 222), Position = UDim2.fromOffset(0, 30) })
+local logText = new("TextLabel", {
+    RichText = true, Text = "", Font = Enum.Font.Code, TextSize = 10, TextColor3 = GRAY,
+    TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
+    BackgroundTransparency = 1, Size = UDim2.new(1, -4, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+    ZIndex = 4, Parent = logScroll,
+})
+
+local LOG_COLORS = { info = GRAY, ok = GREEN, warn = AMBER, err = RED }
+local logLines, plainLines = {}, {}
+local function hex(c)
+    return string.format("#%02x%02x%02x", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+local function esc(s)
+    return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+function Hooks.log(msg, kind)
+    if msg == S.lastLog then return end
+    S.lastLog = msg
+    local stamp = os.date("%H:%M:%S")
+    local color = LOG_COLORS[kind] or GRAY
+    logLines[#logLines + 1] = string.format(
+        '<font color="#5a5a74">[%s]</font> <font color="%s">%s</font>', stamp, hex(color), esc(msg))
+    plainLines[#plainLines + 1] = "[" .. stamp .. "] " .. msg
+    if #logLines > 150 then table.remove(logLines, 1) table.remove(plainLines, 1) end
+    logText.Text = table.concat(logLines, "\n")
+    task.defer(function() logScroll.CanvasPosition = Vector2.new(0, 1000000) end)
+end
+copyLogBtn.MouseButton1Click:Connect(function()
+    if setclip then
+        pcall(setclip, table.concat(plainLines, "\n"))
+        toast("Log copied")
+    else
+        toast("Clipboard not supported")
+    end
+end)
+clearLogBtn.MouseButton1Click:Connect(function()
+    logLines, plainLines = {}, {}
+    logText.Text = ""
+    S.lastLog = nil
+    toast("Log cleared")
+end)
+
+---------------------------------------------------------------------
+-- PAGE 4: SETTINGS --------------------------------------------------
+---------------------------------------------------------------------
+local setPage = pages[4]
+local setScroll = new("ScrollingFrame", {
+    Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+    ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(),
+    ZIndex = 3, Parent = setPage,
+}, {
+    new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
+    new("UIPadding", { PaddingRight = UDim.new(0, 6) }),
+})
+paint(setScroll, "ScrollBarImageColor3", "a")
+
+-- theme picker
+local themeCard = card(setScroll, { Size = UDim2.new(1, 0, 0, 58), LayoutOrder = 1 })
+label(themeCard, {
+    Text = "Theme", Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left,
+    Size = UDim2.fromOffset(80, 16), Position = UDim2.fromOffset(10, 6),
+})
+local themeName = label(themeCard, {
+    Text = theme.name, Font = Enum.Font.GothamBold, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Right,
+    Size = UDim2.fromOffset(100, 16), Position = UDim2.new(1, -110, 0, 6),
+})
+paint(themeName, "TextColor3", "a")
+local swatches = {}
+for i, t in ipairs(THEMES) do
+    local sw = new("TextButton", {
+        Text = "", AutoButtonColor = false, Size = UDim2.fromOffset(26, 26),
+        Position = UDim2.fromOffset(10 + (i - 1) * 34, 26), BackgroundColor3 = t.a,
+        BorderSizePixel = 0, ZIndex = 4, Parent = themeCard,
+    }, { circle() })
+    new("UIGradient", { Color = ColorSequence.new(t.a, t.b), Rotation = 45, Parent = sw })
+    local ring = stroke(WHITE, 2, 1)
+    ring.Parent = sw
+    swatches[i] = ring
+    sw.MouseButton1Click:Connect(function() setTheme(i) end)
+end
+refreshers[#refreshers + 1] = function()
+    themeName.Text = theme.name
+    for i, r in ipairs(swatches) do r.Transparency = (i == cfg.theme) and 0 or 1 end
+end
+swatches[cfg.theme].Transparency = 0
+
+-- transparency slider
+local sliderCard = card(setScroll, { Size = UDim2.new(1, 0, 0, 48), LayoutOrder = 2 })
+label(sliderCard, {
+    Text = "Window Transparency", Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left,
+    Size = UDim2.fromOffset(150, 16), Position = UDim2.fromOffset(10, 6),
+})
+local sliderVal = label(sliderCard, {
+    Text = "0%", Font = Enum.Font.GothamBold, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Right,
+    Size = UDim2.fromOffset(50, 16), Position = UDim2.new(1, -60, 0, 6),
+})
+paint(sliderVal, "TextColor3", "a")
+local hit = new("TextButton", {
+    Text = "", AutoButtonColor = false, BackgroundTransparency = 1,
+    Size = UDim2.new(1, -20, 0, 20), Position = UDim2.fromOffset(10, 24), ZIndex = 4, Parent = sliderCard,
+})
+local rail = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 4), Position = UDim2.new(0, 0, 0.5, -2),
+    BackgroundColor3 = Color3.fromRGB(30, 30, 46), BorderSizePixel = 0, ZIndex = 4, Parent = hit,
+}, { circle() })
+local fill = new("Frame", {
+    Size = UDim2.fromScale(0, 1), BorderSizePixel = 0, ZIndex = 5, Parent = rail,
+}, { circle() })
+paint(fill, "BackgroundColor3", "a")
+local knob = new("Frame", {
+    Size = UDim2.fromOffset(12, 12), BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 6, Parent = rail,
+}, { circle() })
+local function renderSlider()
+    local rel = cfg.opacity / 0.6
+    fill.Size = UDim2.new(rel, 0, 1, 0)
+    knob.Position = UDim2.new(rel, -6, 0.5, -6)
+    sliderVal.Text = math.floor(cfg.opacity * 100 + 0.5) .. "%"
+    main.BackgroundTransparency = cfg.opacity
+end
+renderSlider()
+local sliding = false
+local function slideTo(x)
+    local rel = math.clamp((x - hit.AbsolutePosition.X) / math.max(1, hit.AbsoluteSize.X), 0, 1)
+    cfg.opacity = rel * 0.6
+    renderSlider()
+end
+hit.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        sliding = true
+        slideTo(input.Position.X)
+    end
+end)
+track(UIS.InputChanged:Connect(function(input)
+    if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        slideTo(input.Position.X)
+    end
+end))
+track(UIS.InputEnded:Connect(function(input)
+    if sliding and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        sliding = false
+        saveConfig()
+    end
+end))
+
+-- extra toggles
+local extraCard = listCard(setScroll, 5, 3)
+rowLayout(extraCard)
+switchRow(extraCard, "Skip duplicate codes", "skipDupes", nil, 1)
+switchRow(extraCard, "Auto-copy captured code", "autoCopy", nil, 2)
+switchRow(extraCard, "Toast notifications", "toasts", nil, 3)
+switchRow(extraCard, "Anti-AFK", "antiAfk", function(v) log("Anti-AFK " .. (v and "on" or "off"), "info") end, 4)
+switchRow(extraCard, "Auto-save config", "autoSave", function(v)
+    if v then saveConfig() end
+end, 5)
+
+-- unload
+local unloadBtn = button(setScroll, "Unload GalaxyHub", UDim2.new(1, 0, 0, 30), UDim2.new(), false)
+unloadBtn.LayoutOrder = 4
+unloadBtn.BackgroundColor3 = Color3.fromRGB(60, 20, 28)
+unloadBtn.TextColor3 = Color3.fromRGB(255, 140, 150)
+
+---------------------------------------------------------------------
+-- REFRESH HOOK ------------------------------------------------------
+---------------------------------------------------------------------
+function Hooks.refresh()
+    statNums.captured.Text = tostring(Stats.captured)
+    statNums.submitted.Text = tostring(Stats.submitted)
+    statNums.invalid.Text = tostring(Stats.invalid)
+    local on = cfg.autoCode
+    local col = on and GREEN or RED
+    if not on then
+        statusLabel.Text = "Paused"
+    else
+        statusLabel.Text = "Enabled"
+    end
+    statusLabel.TextColor3 = col
+    dot.BackgroundColor3 = col
+end
+
+---------------------------------------------------------------------
+-- DRAG / MINIMIZE / CLOSE / KEYBIND ---------------------------------
+---------------------------------------------------------------------
+do
+    local dragging, dragStart, startPos, dragInput = false, nil, nil, nil
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    header.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    track(UIS.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local d = input.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+end
+
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    minBtn.Text = minimized and "+" or "-"
+    tween(main, { Size = minimized and MINI or FULL }, 0.25)
+end)
+
+local function unload()
+    if Unloaded then return end
+    Unloaded = true
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    pcall(Functions.onUnload)
+    if getgenv then getgenv().GalaxyHubUnload = nil end
+    pcall(function()
+        TweenService:Create(main, TweenInfo.new(0.2), { Size = UDim2.fromOffset(280, 0) }):Play()
+    end)
+    delay(0.22, function() pcall(function() gui:Destroy() end) end)
+end
+closeBtn.MouseButton1Click:Connect(unload)
+unloadBtn.MouseButton1Click:Connect(unload)
+if getgenv then getgenv().GalaxyHubUnload = unload end
+
+track(UIS.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then gui.Enabled = not gui.Enabled end
+end))
+
+---------------------------------------------------------------------
+-- ANIMATION LOOP ----------------------------------------------------
+---------------------------------------------------------------------
+do
+    local rot, lastSec = 0, -1
+    track(RunService.Heartbeat:Connect(function(dt)
+        rot = (rot + dt * 90) % 360
+        borderGrad.Rotation = rot
+        logoGrad.Rotation = rot
+        dot.BackgroundTransparency = 0.45 * (0.5 + 0.5 * math.sin(os.clock() * 3.2))
+        local sec = math.floor(os.clock() - startTime)
+        if sec ~= lastSec then
+            lastSec = sec
+            timerLabel.Text = string.format("%02d:%02d", math.floor(sec / 60) % 100, sec % 60)
+        end
+    end))
+end
+
+---------------------------------------------------------------------
+-- START -------------------------------------------------------------
+---------------------------------------------------------------------
+refreshers[#refreshers + 1] = function() end
+for _, f in ipairs(refreshers) do pcall(f) end
+refresh()
+log("GalaxyHub loaded", "ok")
+tween(main, { Size = FULL }, 0.4)
+switchTab(1)
